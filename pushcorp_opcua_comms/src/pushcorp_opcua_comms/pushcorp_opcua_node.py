@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 
+import aiorospy
 import rospy
 import sys
 import copy
@@ -8,6 +9,8 @@ import traceback
 import pushcorp_msgs
 import ros_opcua_srvs.srv
 from rospy import ServiceProxy
+from std_msgs.msg import String
+from std_srvs.srv import SetBool, SetBoolRequest, SetBoolResponse
 
 from asyncua import Client, ua, Node
 from asyncua.common.subscription import Subscription
@@ -28,8 +31,7 @@ class FcuData:
         self.Heartbeat: Node = None
         self.st_data_node: Node = None
         self.sub_opcua: Subscription = None
-
-        #self.map_data()
+        self.hb = None
 
     async def map_data(self):
         print(OPCUA_FCU)
@@ -42,30 +44,20 @@ class FcuData:
         self.sub_opcua = await self.client.create_subscription(5, self)
 
         await self.sub_opcua.subscribe_data_change(self.st_data_node)
+        self.event_loop.create_task(self.heartbeat_co())
 
-        self.hb_timer = rospy.Timer(rospy.Duration(1.0), self.heartbeat_cb)
-
-    def datachange_notification(self, node, val, data):
+    async def datachange_notification(self, node, val, data):
         if node == self.st_data_node:
             self.st_data = val
 
         print(f'Datachange {self.st_data.Heartbeat}')
 
     async def heartbeat_co(self):
-        val = self.st_data.Heartbeat
-        print(val)
-
-        await self.Heartbeat.set_value(ua.DataValue(not val))
-
-
-
-    def heartbeat_cb(self, event):
-        if self.Heartbeat is not None:
-            #fut = self.event_loop.create_future()
-            self.event_loop.create_task(self.heartbeat_co())
-
-            #await fut
-
+        while(True):
+            val = self.st_data.Heartbeat
+            print(val)
+            await self.Heartbeat.set_value(ua.DataValue(not val))
+            await asyncio.sleep(1)
 
 
 class PushcorpComms:
@@ -104,6 +96,17 @@ class PushcorpComms:
 
     #        rospy.Timer(rospy.Duration(1.0), self.heartbeat_cb)
 
+    async def setbool_svc(self, req: SetBoolRequest) -> SetBoolResponse:
+        resp = SetBoolResponse()
+        resp.message = 'Neat'
+        resp.success = not req.data
+        return resp
+
+    async def listener(self):
+        sub = aiorospy.AsyncSubscriber('blah', String)
+        async for message in sub.subscribe():
+            print(f'I heard: {message.data}')
+
     async def connect(self):
         self.event_loop = asyncio.get_running_loop()
         self.client = Client(self.opcua_endpoint)
@@ -126,12 +129,19 @@ class PushcorpComms:
 
             # self.sub_handle = self.sub_opcua.subscribe_data_change([self.st_fcu_node, self.st_spindle_node])
 
+            self.server = aiorospy.AsyncService('service', SetBool, self.setbool_svc)
+
             print(self.st_fcu.input.SetForce)
 
             self.fcu_data = FcuData(self.client)
-            await self.fcu_data.map_data()
+            await asyncio.gather(self.listener(),
+                                 self.fcu_data.map_data(),
+                                 self.server.start())
+            print('safsafs')
+            #await self.fcu_data.map_data()
 
-
+        except asyncio.CancelledError:
+            raise
         except:
             traceback.print_exc()
         finally:
@@ -140,8 +150,7 @@ class PushcorpComms:
     async def run(self):
         await self.connect()
 
-        while not rospy.is_shutdown():
-            await asyncio.sleep(1.0)
+
 
     def disconnect(self):
         self.client.disconnect()
@@ -173,11 +182,19 @@ class PushcorpComms:
 if __name__ == '__main__':
     rospy.init_node('pushcorp_comms_node', anonymous=False)
 
+    loop = asyncio.get_event_loop()
+    loop.set_debug(True)
+
     opcua_endpoint = ip = rospy.get_param('~opcua_endpoint', "opc.tcp://192.168.125.39:4840")
 
     pc = PushcorpComms(opcua_endpoint)
 
-    asyncio.run(pc.run())
-# pc.connect()
-# rospy.spin()
-# pc.disconnect()
+    task = loop.create_task(pc.run())
+    aiorospy.cancel_on_exception(task)
+    aiorospy.cancel_on_shutdown(task)
+
+    try:
+        loop.run_until_complete(task)
+    except asyncio.CancelledError:
+        pass
+
