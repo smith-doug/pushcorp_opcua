@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import asyncio
 
 import rospy
 import sys
@@ -8,18 +9,18 @@ import pushcorp_msgs
 import ros_opcua_srvs.srv
 from rospy import ServiceProxy
 
-from opcua import Client
-from opcua import ua
-from opcua.common.node import Node
-from opcua.common.subscription import Subscription
+from asyncua import Client, ua, Node
+from asyncua.common.subscription import Subscription
 
 OPCUA_ROOT = 'ns=4;s=GVL_opcua'
 OPCUA_FCU = 'ns=4;s=GVL_opcua.stFcuControl'
 OPCUA_SPINDLE = 'ns=4;s=GVL_opcua.stSpindleControl'
 
+
 class FcuData:
     def __init__(self, client: Client):
 
+        self.event_loop = asyncio.get_running_loop()
         self.client = client
         self.st_data = None
         self.hb_timer = None
@@ -28,21 +29,19 @@ class FcuData:
         self.st_data_node: Node = None
         self.sub_opcua: Subscription = None
 
-        self.map_data()
+        #self.map_data()
 
-
-    def map_data(self):
+    async def map_data(self):
         print(OPCUA_FCU)
 
         self.st_data_node = self.client.get_node(OPCUA_FCU)
-        self.st_data = self.st_data_node.get_value()
+        self.st_data = await self.st_data_node.get_value()
 
         self.Heartbeat = self.client.get_node(OPCUA_FCU + '.Heartbeat')
 
+        self.sub_opcua = await self.client.create_subscription(5, self)
 
-
-        self.sub_opcua = self.client.create_subscription(500, self)
-        self.sub_opcua.subscribe_data_change(self.st_data_node)
+        await self.sub_opcua.subscribe_data_change(self.st_data_node)
 
         self.hb_timer = rospy.Timer(rospy.Duration(1.0), self.heartbeat_cb)
 
@@ -50,11 +49,22 @@ class FcuData:
         if node == self.st_data_node:
             self.st_data = val
 
-        print(self.st_data.Heartbeat)
+        print(f'Datachange {self.st_data.Heartbeat}')
+
+    async def heartbeat_co(self):
+        val = self.st_data.Heartbeat
+        print(val)
+
+        await self.Heartbeat.set_value(ua.DataValue(not val))
+
+
 
     def heartbeat_cb(self, event):
         if self.Heartbeat is not None:
-            self.Heartbeat.set_value(ua.DataValue(not self.st_data.Heartbeat))
+            #fut = self.event_loop.create_future()
+            self.event_loop.create_task(self.heartbeat_co())
+
+            #await fut
 
 
 
@@ -78,6 +88,7 @@ class PushcorpComms:
     def __init__(self, opcua_endpoint: str):
         self.opcua_endpoint = opcua_endpoint
 
+        self.event_loop = None
         self.client: Client = None
         self.objects: Node = None
         self.st_fcu_node: Node = None
@@ -91,36 +102,34 @@ class PushcorpComms:
 
         self.fcu_data: FcuData = None
 
-#        rospy.Timer(rospy.Duration(1.0), self.heartbeat_cb)
+    #        rospy.Timer(rospy.Duration(1.0), self.heartbeat_cb)
 
-    def connect(self):
-
+    async def connect(self):
+        self.event_loop = asyncio.get_running_loop()
         self.client = Client(self.opcua_endpoint)
-
         try:
-            self.client.connect()
+            await self.client.connect()
             print('connected')
-            self.client.load_type_definitions()
-            self.objects = self.client.get_objects_node()
+            await self.client.load_data_type_definitions()
 
             self.st_fcu_node = self.client.get_node(OPCUA_FCU)
-            self.st_fcu = self.st_fcu_node.get_value()
+            self.st_fcu = await self.st_fcu_node.get_value()
 
             self.st_fcu_input_node = self.client.get_node(OPCUA_FCU + '.input')
 
             self.st_spindle_node = self.client.get_node(OPCUA_SPINDLE)
-            self.st_spindle = self.st_spindle_node.get_value()
+            self.st_spindle = await self.st_spindle_node.get_value()
 
             # subscribing to a variable node
 
-            self.sub_opcua = self.client.create_subscription(500, self)
+            # self.sub_opcua = self.client.create_subscription(500, self)
 
+            # self.sub_handle = self.sub_opcua.subscribe_data_change([self.st_fcu_node, self.st_spindle_node])
 
-            self.sub_handle = self.sub_opcua.subscribe_data_change([self.st_fcu_node, self.st_spindle_node])
-
-            print(self.st_fcu_node.get_value().input.SetForce)
+            print(self.st_fcu.input.SetForce)
 
             self.fcu_data = FcuData(self.client)
+            await self.fcu_data.map_data()
 
 
         except:
@@ -128,6 +137,11 @@ class PushcorpComms:
         finally:
             pass
 
+    async def run(self):
+        await self.connect()
+
+        while not rospy.is_shutdown():
+            await asyncio.sleep(1.0)
 
     def disconnect(self):
         self.client.disconnect()
@@ -141,7 +155,7 @@ class PushcorpComms:
         rospy.loginfo('Calling disconnect on startup')
         dc_resp = self.opcua_srv_disconnect()
 
-        #Connect to plc
+        # Connect to plc
         rospy.loginfo(f'Calling connect to {opcua_endpoint}')
 
         resp: ros_opcua_srvs.srv.ConnectResponse = self.opcua_srv_connect(self.opcua_endpoint)
@@ -156,16 +170,14 @@ class PushcorpComms:
             self.opcua_srv_disconnect()
 
 
-
-
-
-
 if __name__ == '__main__':
     rospy.init_node('pushcorp_comms_node', anonymous=False)
 
     opcua_endpoint = ip = rospy.get_param('~opcua_endpoint', "opc.tcp://192.168.125.39:4840")
 
     pc = PushcorpComms(opcua_endpoint)
-    pc.connect()
-    rospy.spin()
-    pc.disconnect()
+
+    asyncio.run(pc.run())
+# pc.connect()
+# rospy.spin()
+# pc.disconnect()

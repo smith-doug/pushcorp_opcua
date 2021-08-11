@@ -21,6 +21,7 @@ catkin_package(
 catkin_install_python(
   PROGRAMS
     src/pushcorp_opcua_comms/pushcorp_opcua_node.py
+    src/pushcorp_opcua_comms/async_test.py
   DESTINATION
     ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
