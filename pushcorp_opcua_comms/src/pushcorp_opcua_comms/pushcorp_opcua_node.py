@@ -45,10 +45,6 @@ class OpcuaData:
         self.pubs = {}
         self.srvs = []
 
-
-
-
-
     async def map_data(self):
         print(self.node_uri)
 
@@ -81,17 +77,18 @@ class OpcuaData:
 
             if sub is not None:
                 self.subs[str(key)] = sub
-                #self.subs.append(sub)
+                # self.subs.append(sub)
 
         for key, val in out_vars.items():
             pub = None
             topic_name = self.ns + '/' + str(key)
             if isinstance(val, float):
                 pub = rospy.Publisher(topic_name, Float32, queue_size=1)
-            elif isinstance(val, int) or isinstance(val, IntEnum):
-                pub = rospy.Publisher(topic_name, Int32, queue_size=1)
             elif isinstance(val, bool):
                 pub = rospy.Publisher(topic_name, Bool, queue_size=1)
+            elif isinstance(val, int) or isinstance(val, IntEnum):
+                pub = rospy.Publisher(topic_name, Int32, queue_size=1)
+
             else:
                 print(f'Unknown type {key}, {type(val)} in structure')
 
@@ -101,19 +98,20 @@ class OpcuaData:
         for key, val in in_vars.items():
             srv = None
             topic_name = self.ns + '/' + str(key)
+            name = str(key)
 
-            if type(val) is float:
+            if isinstance(val, float):
                 srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetFloat32,
-                                            lambda req: self.svc_handler(req=req, name=key,
-                                                                         ret_type=pushcorp_msgs.srv.SetFloat32Response))
-            elif type(val) is int or isinstance(val, IntEnum):
-                srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetInt32,
-                                            lambda req: self.svc_handler(req=req, name=key,
-                                                                         ret_type=pushcorp_msgs.srv.SetInt32Response))
-            elif type(val) is bool:
+                                            (lambda req, name=name: self.svc_handler(req, str(name),
+                                                                         pushcorp_msgs.srv.SetFloat32Response)))
+            elif isinstance(val, bool):
                 srv = aiorospy.AsyncService(topic_name, std_srvs.srv.SetBool,
-                                            lambda req: self.svc_handler(req=req, name=key,
-                                                                         ret_type=std_srvs.srv.SetBoolResponse))
+                                            lambda req, name=name: self.svc_handler(req, name,
+                                                                         std_srvs.srv.tSetBoolResponse))
+            elif isinstance(val, int) or isinstance(val, IntEnum):
+                srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetInt32,
+                                            lambda req, name=name: self.svc_handler(req, name, pushcorp_msgs.srv.SetInt32Response))
+
             else:
                 print(f'Unknown type {key}, {type(val)} in structure')
 
@@ -124,8 +122,8 @@ class OpcuaData:
         asyncio.create_task(self.svc_handlers_init())
         asyncio.create_task(self.topic_publishers_init())
 
-
     async def svc_handler(self, req, name, ret_type):
+        name = name
         rospy.loginfo(f'Updating {name} to {req.data}')
         await self.set_named_val(name, req.data)
         return ret_type(success=True)
@@ -134,15 +132,20 @@ class OpcuaData:
         await asyncio.gather(*[srv.start() for srv in self.srvs])
 
     async def topic_publisher(self, name, pub):
-        while True:
-            vals_current = self.st_data.output
-            val = getattr(vals_current, name)
-            pub.publish(val)
-            await asyncio.sleep(0.005)
+        try:
 
+            while True:
+                vals_current = self.st_data.output
+                val = getattr(vals_current, name)
+                pub.publish(val)
+                await asyncio.sleep(0.005)
+        except:
+            traceback.print_exc()
 
     async def topic_publishers_init(self):
-        await asyncio.gather(*[self.topic_publisher(pub[0], pub[1]) for pub in self.pubs.items()])
+        for key, val in self.pubs.items():
+            asyncio.create_task(self.topic_publisher(key, val))
+        # await asyncio.gather(*[self.topic_publisher(pub[0], pub[1]) for pub in self.pubs.items()])
 
     async def topic_listener(self, name, sub):
         async for msg in sub.subscribe():
@@ -184,6 +187,7 @@ class OpcuaData:
             await self.set_input_vals(vals_current)
         except:
             traceback.print_exc()
+
 
 class PushcorpComms:
 
@@ -238,11 +242,10 @@ class PushcorpComms:
 
             self.spindle_data = OpcuaData(self.client, OPCUA_SPINDLE, '/pushcorp/spindle')
 
-
             await asyncio.gather(self.listener(),
                                  self.fcu_data.map_data(),
-                                 self.spindle_data.map_data(),
-                                 self.server.start())
+                                 self.spindle_data.map_data())
+                                 #self.server.start())
 
         except asyncio.CancelledError:
             raise
@@ -269,7 +272,7 @@ if __name__ == '__main__':
     pc = PushcorpComms(opcua_ep)
 
     task = loop.create_task(pc.run())
-    #aiorospy.cancel_on_exception(task)
+    # aiorospy.cancel_on_exception(task)
     aiorospy.cancel_on_shutdown(task)
 
     try:
