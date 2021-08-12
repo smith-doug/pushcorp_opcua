@@ -24,7 +24,7 @@ OPCUA_FCU = 'ns=4;s=GVL_opcua.stFcuControl'
 OPCUA_SPINDLE = 'ns=4;s=GVL_opcua.stSpindleControl'
 
 
-class FcuData:
+class OpcuaData:
 
     # noinspection PyTypeChecker
     def __init__(self, client: Client, node_uri: str, ns: str):
@@ -41,8 +41,13 @@ class FcuData:
         self.st_data_input_node: Node = None
         self.sub_opcua: Subscription = None
         self.lock = asyncio.Lock()
-        self.subs = []
+        self.subs = {}
+        self.pubs = {}
         self.srvs = []
+
+
+
+
 
     async def map_data(self):
         print(self.node_uri)
@@ -61,24 +66,42 @@ class FcuData:
         self.st_data = await self.st_data_node.get_value()
 
         in_vars = vars(self.st_data.input)
+        out_vars = vars(self.st_data.output)
         for key, val in in_vars.items():
             sub = None
             topic_name = self.ns + '/' + str(key)
-            if type(val) is float:
+            if isinstance(val, float):
                 sub = aiorospy.AsyncSubscriber(topic_name, Float32)
-            elif type(val) is int or isinstance(val, IntEnum):
+            elif isinstance(val, int) or isinstance(val, IntEnum):
                 sub = aiorospy.AsyncSubscriber(topic_name, Int32)
-            elif type(val) is bool:
+            elif isinstance(val, bool):
                 sub = aiorospy.AsyncSubscriber(topic_name, Bool)
             else:
                 print(f'Unknown type {key}, {type(val)} in structure')
 
             if sub is not None:
-                self.subs.append(sub)
+                self.subs[str(key)] = sub
+                #self.subs.append(sub)
+
+        for key, val in out_vars.items():
+            pub = None
+            topic_name = self.ns + '/' + str(key)
+            if isinstance(val, float):
+                pub = rospy.Publisher(topic_name, Float32, queue_size=1)
+            elif isinstance(val, int) or isinstance(val, IntEnum):
+                pub = rospy.Publisher(topic_name, Int32, queue_size=1)
+            elif isinstance(val, bool):
+                pub = rospy.Publisher(topic_name, Bool, queue_size=1)
+            else:
+                print(f'Unknown type {key}, {type(val)} in structure')
+
+            if pub is not None:
+                self.pubs[str(key)] = pub
 
         for key, val in in_vars.items():
             srv = None
             topic_name = self.ns + '/' + str(key)
+
             if type(val) is float:
                 srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetFloat32,
                                             lambda req: self.svc_handler(req=req, name=key,
@@ -97,24 +120,37 @@ class FcuData:
             if srv is not None:
                 self.srvs.append(srv)
 
-        # asyncio.create_task(self.topic_listeners_init())
+        asyncio.create_task(self.topic_listeners_init())
         asyncio.create_task(self.svc_handlers_init())
+        asyncio.create_task(self.topic_publishers_init())
+
 
     async def svc_handler(self, req, name, ret_type):
+        rospy.loginfo(f'Updating {name} to {req.data}')
         await self.set_named_val(name, req.data)
         return ret_type(success=True)
-
 
     async def svc_handlers_init(self):
         await asyncio.gather(*[srv.start() for srv in self.srvs])
 
-    async def topic_listener(self, sub):
+    async def topic_publisher(self, name, pub):
+        while True:
+            vals_current = self.st_data.output
+            val = getattr(vals_current, name)
+            pub.publish(val)
+            await asyncio.sleep(0.005)
+
+
+    async def topic_publishers_init(self):
+        await asyncio.gather(*[self.topic_publisher(pub[0], pub[1]) for pub in self.pubs.items()])
+
+    async def topic_listener(self, name, sub):
         async for msg in sub.subscribe():
             print(f'{sub.name} Heard {msg.data}')
-            await self.set_named_val(sub.name, msg.data)
+            await self.set_named_val(name, msg.data)
 
     async def topic_listeners_init(self):
-        await asyncio.gather(*[self.topic_listener(sub) for sub in self.subs])
+        await asyncio.gather(*[self.topic_listener(sub[0], sub[1]) for sub in self.subs.items()])
 
     async def datachange_notification(self, node, val, data):
         if node == self.st_data_node:
@@ -123,7 +159,6 @@ class FcuData:
     async def heartbeat_co(self):
         while True:
             val = not self.st_data.Heartbeat
-            print(val)
             try:
                 await self.Heartbeat.set_value(ua.DataValue(val))
             except asyncio.exceptions.TimeoutError:
@@ -144,7 +179,6 @@ class FcuData:
     async def set_named_val(self, name: str, value: any):
 
         vals_current = self.st_data.input
-        v = vars(vals_current)
         setattr(vals_current, name, value)
         try:
             await self.set_input_vals(vals_current)
@@ -171,8 +205,8 @@ class PushcorpComms:
 
         self.st_fcu_input_node: Node = None
 
-        self.fcu_data: FcuData = None
-        self.spindle_data: FcuData = None
+        self.fcu_data: OpcuaData = None
+        self.spindle_data: OpcuaData = None
 
     async def setbool_svc(self, req: SetBoolRequest) -> SetBoolResponse:
         resp = SetBoolResponse()
@@ -200,9 +234,9 @@ class PushcorpComms:
 
             self.server = aiorospy.AsyncService('service', SetBool, self.setbool_svc)
 
-            self.fcu_data = FcuData(self.client, OPCUA_FCU, '/pushcorp/fcu')
+            self.fcu_data = OpcuaData(self.client, OPCUA_FCU, '/pushcorp/fcu')
 
-            self.spindle_data = FcuData(self.client, OPCUA_SPINDLE, '/pushcorp/spindle')
+            self.spindle_data = OpcuaData(self.client, OPCUA_SPINDLE, '/pushcorp/spindle')
 
 
             await asyncio.gather(self.listener(),
@@ -235,7 +269,7 @@ if __name__ == '__main__':
     pc = PushcorpComms(opcua_ep)
 
     task = loop.create_task(pc.run())
-    aiorospy.cancel_on_exception(task)
+    #aiorospy.cancel_on_exception(task)
     aiorospy.cancel_on_shutdown(task)
 
     try:
