@@ -38,9 +38,11 @@ class OpcuaData:
         self.event_loop = asyncio.get_running_loop()
         self.client: Client = client
 
-        self.heartbeat: Node = None
+        self.heartbeat: Node = None  # Heartbeat gets written separately
 
         self.st_data = None  # Full data (hb, input, output), will be a struct created by magic
+        self.st_data_input = None
+
         self.st_data_node: Node = None  # Node the the full data
         self.st_data_input_node: Node = None  # Node to the input (writable) data
         self.sub_opcua: Subscription = None
@@ -64,6 +66,8 @@ class OpcuaData:
         # Subscribe to the entire struct
         self.sub_opcua = await self.client.create_subscription(5, self)
         await self.sub_opcua.subscribe_data_change(self.st_data_node)
+        #await self.sub_opcua.subscribe_data_change(self.st_data_input_node)
+
         self.event_loop.create_task(self.heartbeat_co())
 
         # Create topics and services for structure data
@@ -146,7 +150,7 @@ class OpcuaData:
                 vals_current = self.st_data.output
                 val = getattr(vals_current, name)
                 pub.publish(val)
-                await asyncio.sleep(0.005)
+                await asyncio.sleep(self.params.topic_pub_pd)
         except:
             traceback.print_exc()
             raise
@@ -165,13 +169,14 @@ class OpcuaData:
 
     async def datachange_notification(self, node, val, data):
         if node == self.st_data_node:
+            #async with self.lock: # could this cause old data to overwrite it if a write is blocking?
             self.st_data = val
 
     async def heartbeat_co(self):
         while True:
             val = not self.st_data.Heartbeat
             try:
-                await self.heartbeat.set_value(ua.DataValue(val))
+                await self.heartbeat.write_value(ua.DataValue(val))
             except asyncio.exceptions.TimeoutError:
                 rospy.logerr(f"{self.ns} Heartbeat to opcua timed out")
                 raise
@@ -180,21 +185,23 @@ class OpcuaData:
     def get_input_vals(self):
         return self.st_data.input
 
-    async def set_input_vals(self, data):
-        async with self.lock:
-            await self.st_data_input_node.write_value(ua.DataValue(data))
-
     def get_output_vals(self):
         return self.st_data.output
 
-    async def set_named_val(self, name: str, value: any):
-
-        vals_current = self.st_data.input
-        setattr(vals_current, name, value)
+    async def set_input_vals(self, data):
         try:
-            await self.set_input_vals(vals_current)
+            await self.st_data_input_node.write_value(ua.DataValue(data))
         except:
-            traceback.print_exc()
+            pass
+
+    async def set_named_val(self, name: str, value: any):
+        async with self.lock:
+            vals = self.st_data.input
+            setattr(vals, name, value)
+            try:
+                await self.set_input_vals(vals)
+            except:
+                traceback.print_exc()
 
 
 class OpcuaComms:
@@ -261,7 +268,7 @@ if __name__ == '__main__':
     spindle_params = OpcuaDataParams(nodeid='ns=4;s=GVL_opcua.stSpindleControl', ns='/pushcorp/spindle')
 
     param_list.append(fcu_params)
-    param_list.append(spindle_params)
+    #param_list.append(spindle_params)
 
     pc = OpcuaComms(opcua_ep, param_list)
 
