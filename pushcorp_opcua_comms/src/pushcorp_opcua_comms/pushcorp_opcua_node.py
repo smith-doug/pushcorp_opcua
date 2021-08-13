@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-import asyncio
 
-from typing import Optional
+import asyncio
 import aiorospy
 import rospy
-import sys
-import copy
 import traceback
 import pushcorp_msgs
-import ros_opcua_srvs.srv
 import std_srvs.srv
-from rospy import ServiceProxy
 from std_msgs.msg import String, Float32, Bool, Int32
 from std_srvs.srv import SetBool, SetBoolRequest, SetBoolResponse
 import pushcorp_msgs.srv
@@ -24,45 +19,58 @@ OPCUA_FCU = 'ns=4;s=GVL_opcua.stFcuControl'
 OPCUA_SPINDLE = 'ns=4;s=GVL_opcua.stSpindleControl'
 
 
+class OpcuaDataParams:
+    def __init__(self, nodeid='', ns='', topic_pub_pd=0.005, opcua_sub_pd=0.005):
+        self.nodeid = nodeid
+        self.ns = ns
+        self.topic_pub_pd = topic_pub_pd
+        self.opcua_sub_pd = opcua_sub_pd
+
+
 class OpcuaData:
 
     # noinspection PyTypeChecker
-    def __init__(self, client: Client, node_uri: str, ns: str):
+    def __init__(self, client: Client, params: OpcuaDataParams):
 
-        self.ns = ns
-        self.node_uri = node_uri
+        self.params = params
+        self.ns = params.ns
+        self.nodeid = params.nodeid
         self.event_loop = asyncio.get_running_loop()
         self.client: Client = client
 
-        self.Heartbeat: Node = None
+        self.heartbeat: Node = None
 
-        self.st_data = None  # Full data (hb, input, output)
-        self.st_data_node: Node = None
-        self.st_data_input_node: Node = None
+        self.st_data = None  # Full data (hb, input, output), will be a struct created by magic
+        self.st_data_node: Node = None  # Node the the full data
+        self.st_data_input_node: Node = None  # Node to the input (writable) data
         self.sub_opcua: Subscription = None
         self.lock = asyncio.Lock()
-        self.subs = {}
-        self.pubs = {}
-        self.srvs = []
+
+        self.subs = {}  # Ros subscribers
+        self.pubs = {}  # Ros publishers
+        self.srvs = []  # Ros services
 
     async def map_data(self):
-        print(self.node_uri)
+        rospy.loginfo(f'OpcuaData mapping with nodeid {self.nodeid}')
 
-        self.st_data_node = self.client.get_node(self.node_uri)
+        self.st_data_node = self.client.get_node(self.nodeid)
         self.st_data = await self.st_data_node.get_value()
-        self.st_data_input_node = self.client.get_node(self.node_uri + '.input')
+        # Input is a separate Node so that you don't overwrite outputs from the plc
+        self.st_data_input_node = self.client.get_node(self.nodeid + '.input')
 
-        self.Heartbeat = self.client.get_node(self.node_uri + '.Heartbeat')
+        # Heartbeat gets written separately but updating it will still cause the opcua subscriber to fire
+        self.heartbeat = self.client.get_node(self.nodeid + '.Heartbeat')
 
+        # Subscribe to the entire struct
         self.sub_opcua = await self.client.create_subscription(5, self)
-
         await self.sub_opcua.subscribe_data_change(self.st_data_node)
         self.event_loop.create_task(self.heartbeat_co())
 
-        self.st_data = await self.st_data_node.get_value()
-
+        # Create topics and services for structure data
         in_vars = vars(self.st_data.input)
         out_vars = vars(self.st_data.output)
+
+        # Create subscribers for input data
         for key, val in in_vars.items():
             sub = None
             topic_name = self.ns + '/' + str(key)
@@ -73,12 +81,12 @@ class OpcuaData:
             elif isinstance(val, bool):
                 sub = aiorospy.AsyncSubscriber(topic_name, Bool)
             else:
-                print(f'Unknown type {key}, {type(val)} in structure')
+                rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
 
             if sub is not None:
                 self.subs[str(key)] = sub
-                # self.subs.append(sub)
 
+        # Create topic publishers for outputs
         for key, val in out_vars.items():
             pub = None
             topic_name = self.ns + '/' + str(key)
@@ -90,11 +98,12 @@ class OpcuaData:
                 pub = rospy.Publisher(topic_name, Int32, queue_size=1)
 
             else:
-                print(f'Unknown type {key}, {type(val)} in structure')
+                rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
 
             if pub is not None:
                 self.pubs[str(key)] = pub
 
+        # Create services
         for key, val in in_vars.items():
             srv = None
             topic_name = self.ns + '/' + str(key)
@@ -103,24 +112,24 @@ class OpcuaData:
             if isinstance(val, float):
                 srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetFloat32,
                                             (lambda req, name=name: self.svc_handler(req, str(name),
-                                                                         pushcorp_msgs.srv.SetFloat32Response)))
+                                                                                     pushcorp_msgs.srv.SetFloat32Response)))
             elif isinstance(val, bool):
                 srv = aiorospy.AsyncService(topic_name, std_srvs.srv.SetBool,
                                             lambda req, name=name: self.svc_handler(req, name,
-                                                                         std_srvs.srv.tSetBoolResponse))
+                                                                                    std_srvs.srv.SetBoolResponse))
             elif isinstance(val, int) or isinstance(val, IntEnum):
                 srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetInt32,
-                                            lambda req, name=name: self.svc_handler(req, name, pushcorp_msgs.srv.SetInt32Response))
-
+                                            lambda req, name=name: self.svc_handler(req, name,
+                                                                                    pushcorp_msgs.srv.SetInt32Response))
             else:
-                print(f'Unknown type {key}, {type(val)} in structure')
+                rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
 
             if srv is not None:
                 self.srvs.append(srv)
 
-        asyncio.create_task(self.topic_listeners_init())
-        asyncio.create_task(self.svc_handlers_init())
-        asyncio.create_task(self.topic_publishers_init())
+        self.event_loop.create_task(self.topic_listeners_init())
+        self.event_loop.create_task(self.svc_handlers_init())
+        self.event_loop.create_task(self.topic_publishers_init())
 
     async def svc_handler(self, req, name, ret_type):
         name = name
@@ -133,7 +142,6 @@ class OpcuaData:
 
     async def topic_publisher(self, name, pub):
         try:
-
             while True:
                 vals_current = self.st_data.output
                 val = getattr(vals_current, name)
@@ -141,11 +149,11 @@ class OpcuaData:
                 await asyncio.sleep(0.005)
         except:
             traceback.print_exc()
+            raise
 
     async def topic_publishers_init(self):
         for key, val in self.pubs.items():
-            asyncio.create_task(self.topic_publisher(key, val))
-        # await asyncio.gather(*[self.topic_publisher(pub[0], pub[1]) for pub in self.pubs.items()])
+            self.event_loop.create_task(self.topic_publisher(key, val))
 
     async def topic_listener(self, name, sub):
         async for msg in sub.subscribe():
@@ -163,7 +171,7 @@ class OpcuaData:
         while True:
             val = not self.st_data.Heartbeat
             try:
-                await self.Heartbeat.set_value(ua.DataValue(val))
+                await self.heartbeat.set_value(ua.DataValue(val))
             except asyncio.exceptions.TimeoutError:
                 rospy.logerr(f"{self.ns} Heartbeat to opcua timed out")
                 raise
@@ -189,63 +197,42 @@ class OpcuaData:
             traceback.print_exc()
 
 
-class PushcorpComms:
-
-    # def event_notification(self, event):
-    #     print("Python: New event", event)
+class OpcuaComms:
 
     # noinspection PyTypeChecker
-    def __init__(self, opcua_endpoint: str):
+    def __init__(self, opcua_endpoint: str, opcua_params: list):
         self.opcua_endpoint = opcua_endpoint
+        self.opcua_params = opcua_params
 
         self.event_loop = None
         self.client: Client = None
-        self.st_fcu_node: Node = None
-        self.st_spindle_node: Node = None
-        self.st_fcu = None
-        self.st_spindle = None
-        self.sub_opcua: Subscription = None
-        self.sub_handle: Subscription = None
 
-        self.st_fcu_input_node: Node = None
+        self.opcua_data_list: list[OpcuaData] = []
 
         self.fcu_data: OpcuaData = None
         self.spindle_data: OpcuaData = None
 
-    async def setbool_svc(self, req: SetBoolRequest) -> SetBoolResponse:
-        resp = SetBoolResponse()
-        resp.message = 'Neat'
-        resp.success = not req.data
-        return resp
-
-    async def listener(self):
-
-        sub = aiorospy.AsyncSubscriber('~/blah', String)
-
-        async for message in sub.subscribe():
-            await self.fcu_data.set_named_val('SetForce', 15)
+    # Simple way to keep the loop alive
+    async def keep_alive(self):
+        while True:
+            await asyncio.sleep(1.0)
 
     async def connect(self):
         self.event_loop = asyncio.get_running_loop()
         self.client = Client(self.opcua_endpoint)
         try:
             await self.client.connect()
-            print('connected')
+            rospy.loginfo(f'opcua client connected to {self.opcua_endpoint}')
+
+            # Load types so they're available to the data objects
             await self.client.load_data_type_definitions()
 
-            self.st_spindle_node = self.client.get_node(OPCUA_SPINDLE)
-            self.st_spindle = await self.st_spindle_node.get_value()
+            for param in self.opcua_params:
+                self.opcua_data_list.append(OpcuaData(self.client, param))
+                rospy.loginfo(f'Created OpcuaData {param.nodeid}, {param.ns}')
 
-            self.server = aiorospy.AsyncService('service', SetBool, self.setbool_svc)
-
-            self.fcu_data = OpcuaData(self.client, OPCUA_FCU, '/pushcorp/fcu')
-
-            self.spindle_data = OpcuaData(self.client, OPCUA_SPINDLE, '/pushcorp/spindle')
-
-            await asyncio.gather(self.listener(),
-                                 self.fcu_data.map_data(),
-                                 self.spindle_data.map_data())
-                                 #self.server.start())
+            await asyncio.gather(*[data.map_data() for data in self.opcua_data_list],
+                                 self.keep_alive())
 
         except asyncio.CancelledError:
             raise
@@ -257,8 +244,8 @@ class PushcorpComms:
     async def run(self):
         await self.connect()
 
-    def disconnect(self):
-        self.client.disconnect()
+    async def disconnect(self):
+        await self.client.disconnect()
 
 
 if __name__ == '__main__':
@@ -269,7 +256,14 @@ if __name__ == '__main__':
 
     opcua_ep = ip = rospy.get_param('~opcua_endpoint', "opc.tcp://192.168.125.39:4840")
 
-    pc = PushcorpComms(opcua_ep)
+    param_list = []
+    fcu_params = OpcuaDataParams(nodeid='ns=4;s=GVL_opcua.stFcuControl', ns='/pushcorp/fcu')
+    spindle_params = OpcuaDataParams(nodeid='ns=4;s=GVL_opcua.stSpindleControl', ns='/pushcorp/spindle')
+
+    param_list.append(fcu_params)
+    param_list.append(spindle_params)
+
+    pc = OpcuaComms(opcua_ep, param_list)
 
     task = loop.create_task(pc.run())
     # aiorospy.cancel_on_exception(task)
