@@ -52,6 +52,10 @@ class OpcuaData:
         self.pubs = {}  # Ros publishers
         self.srvs = []  # Ros services
 
+        # self.input_nodes: dict[str, Node] = {}
+
+        self.updated = asyncio.Event()  # Set when st_data is updated by event
+
     async def map_data(self):
         rospy.loginfo(f'OpcuaData mapping with nodeid {self.nodeid}')
 
@@ -64,9 +68,9 @@ class OpcuaData:
         self.heartbeat = self.client.get_node(self.nodeid + '.Heartbeat')
 
         # Subscribe to the entire struct
-        self.sub_opcua = await self.client.create_subscription(5, self)
+        self.sub_opcua = await self.client.create_subscription(self.params.opcua_sub_pd, self)
         await self.sub_opcua.subscribe_data_change(self.st_data_node)
-        #await self.sub_opcua.subscribe_data_change(self.st_data_input_node)
+        # await self.sub_opcua.subscribe_data_change(self.st_data_input_node)
 
         self.event_loop.create_task(self.heartbeat_co())
 
@@ -119,12 +123,12 @@ class OpcuaData:
                                                                                      pushcorp_msgs.srv.SetFloat32Response)))
             elif isinstance(val, bool):
                 srv = aiorospy.AsyncService(topic_name, std_srvs.srv.SetBool,
-                                            lambda req, name=name: self.svc_handler(req, name,
-                                                                                    std_srvs.srv.SetBoolResponse))
+                                            (lambda req, name=name: self.svc_handler(req, name,
+                                                                                    std_srvs.srv.SetBoolResponse)))
             elif isinstance(val, int) or isinstance(val, IntEnum):
                 srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetInt32,
-                                            lambda req, name=name: self.svc_handler(req, name,
-                                                                                    pushcorp_msgs.srv.SetInt32Response))
+                                            (lambda req, name=name: self.svc_handler(req, name,
+                                                                                    pushcorp_msgs.srv.SetInt32Response)))
             else:
                 rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
 
@@ -138,18 +142,25 @@ class OpcuaData:
     async def svc_handler(self, req, name, ret_type):
         name = name
         rospy.loginfo(f'Updating {name} to {req.data}')
-        await self.set_named_val(name, req.data)
-        return ret_type(success=True)
+        try:
+            await self.set_named_val(name, req.data)
+            return ret_type(success=True)
+        except asyncio.exceptions:
+            return ret_type(success=True, msg=traceback.format_exc(limit=1))
 
     async def svc_handlers_init(self):
         await asyncio.gather(*[srv.start() for srv in self.srvs])
 
-    async def topic_publisher(self, name, pub):
+    async def topic_publisher(self, name, pub: rospy.Publisher):
         try:
             while True:
-                vals_current = self.st_data.output
-                val = getattr(vals_current, name)
-                pub.publish(val)
+                if pub.get_num_connections() > 0:
+                    vals_current = self.st_data.output
+                    val = getattr(vals_current, name)
+                    pub.publish(val)
+                else:
+                    await(asyncio.sleep(1.0))
+
                 await asyncio.sleep(self.params.topic_pub_pd)
         except:
             traceback.print_exc()
@@ -169,8 +180,12 @@ class OpcuaData:
 
     async def datachange_notification(self, node, val, data):
         if node == self.st_data_node:
-            #async with self.lock: # could this cause old data to overwrite it if a write is blocking?
-            self.st_data = val
+            if self.lock.locked():  # Updated in the middle of a write?  Could be old values?
+                rospy.loginfo('datachange_notification update discarded')
+                return
+            async with self.lock:  # could this cause old data to overwrite it if a write is blocking?
+                self.st_data = val
+                self.updated.set()
 
     async def heartbeat_co(self):
         while True:
@@ -192,18 +207,24 @@ class OpcuaData:
         try:
             await self.st_data_input_node.write_value(ua.DataValue(data))
         except:
-            pass
+            raise
 
     async def set_named_val(self, name: str, value: any):
+        ####@TODO look at this.  The intenet was to make sure I have fesh input data.
+        # This whole "write a full struct thing" is probably more complicated than it's worth
+        await self.updated.wait()
         async with self.lock:
             vals = self.st_data.input
             setattr(vals, name, value)
             try:
                 await self.set_input_vals(vals)
+                # self.st_data.input = await self.st_data_input_node.read_value()
+                self.updated.clear()
             except:
                 traceback.print_exc()
+                raise
 
-
+#self.st_data_input_node.get_child()
 class OpcuaComms:
 
     # noinspection PyTypeChecker
@@ -268,12 +289,12 @@ if __name__ == '__main__':
     spindle_params = OpcuaDataParams(nodeid='ns=4;s=GVL_opcua.stSpindleControl', ns='/pushcorp/spindle')
 
     param_list.append(fcu_params)
-    #param_list.append(spindle_params)
+    param_list.append(spindle_params)
 
     pc = OpcuaComms(opcua_ep, param_list)
 
     task = loop.create_task(pc.run())
-    # aiorospy.cancel_on_exception(task)
+    aiorospy.cancel_on_exception(task)
     aiorospy.cancel_on_shutdown(task)
 
     try:
