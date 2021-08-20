@@ -48,8 +48,10 @@ class NodeData:
         #except asyncua.ua.UaError.BadAttributeIdInvalid:
 
         except ua.UaStatusCodeError as er:
-            if er.code != ua.StatusCodes.BadAttributeIdInvalid:
+            if er.code not in [ua.StatusCodes.BadAttributeIdInvalid, ua.StatusCodes.BadNotImplemented]:
                 rospy.logerr(f'Unexpected error in NodeData.init: {er}')
+            else:
+                pass
             return False
 
     def get_value(self):
@@ -81,7 +83,7 @@ class OpcuaData:
         # self.st_data = None  # Full data (hb, input, output), will be a struct created by magic
         # self.st_data_input = None
 
-        self.st_data_node: Node = None  # Node the the full data
+        self.st_root_node: Node = None  # Node the the full data
         self.st_data_input_node: Node = None  # Node to the input (writable) data
         self.sub_opcua: Subscription = None
         self.lock = asyncio.Lock()
@@ -113,6 +115,8 @@ class OpcuaData:
         sub_nodeid = f'{base_node.nodeid.to_string()}.{subnode_str}'
         sub_node = self.client.get_node(sub_nodeid)
 
+
+
         child_nodes = await ua_utils.get_node_children(sub_node)
 
         ret_nodes: Dict[str, NodeData] = {}
@@ -126,9 +130,9 @@ class OpcuaData:
         return ret_nodes
 
     async def map_io_data_nodes(self):
-        self.status_nodes = await self.map_children(self.st_data_node, 'status')
-        self.input_nodes = await self.map_children(self.st_data_node, 'input')
-        self.output_nodes = await self.map_children(self.st_data_node, 'output')
+        self.status_nodes = await self.map_children(self.st_root_node, 'status')
+        self.input_nodes = await self.map_children(self.st_root_node, 'input')
+        self.output_nodes = await self.map_children(self.st_root_node, 'output')
 
         self.all_nodes = {**self.status_nodes, **self.input_nodes, **self.output_nodes}
 
@@ -141,13 +145,7 @@ class OpcuaData:
     async def map_data(self):
         rospy.loginfo(f'OpcuaData mapping with nodeid {self.nodeid}')
 
-        self.st_data_node = self.client.get_node(self.nodeid)
-        # self.st_data = await self.st_data_node.get_value()
-        # Input is a separate Node so that you don't overwrite outputs from the plc
-        # self.st_data_input_node = self.client.get_node(self.nodeid + '.input')
-
-        # Heartbeat gets written separately but updating it will still cause the opcua subscriber to fire
-        #self.heartbeat = self.client.get_node(self.nodeid + '.Heartbeat')
+        self.st_root_node = self.client.get_node(self.nodeid)
 
         await self.map_io_data_nodes()
 
@@ -161,29 +159,8 @@ class OpcuaData:
 
         await self.sub_opcua.subscribe_data_change([*items_status, *items_in, *items_out])
 
-        self.event_loop.create_task(self.heartbeat_co())
 
-
-
-
-
-        # Create subscribers for input data
-        # for key, val in in_vars.items():
-        #     sub = None
-        #     topic_name = self.ns + '/' + str(key)
-        #     if isinstance(val, float):
-        #         sub = aiorospy.AsyncSubscriber(topic_name, Float32)
-        #     elif isinstance(val, int) or isinstance(val, IntEnum):
-        #         sub = aiorospy.AsyncSubscriber(topic_name, Int32)
-        #     elif isinstance(val, bool):
-        #         sub = aiorospy.AsyncSubscriber(topic_name, Bool)
-        #     else:
-        #         rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
-        #
-        #     if sub is not None:
-        #         self.subs[str(key)] = sub
-
-        # Create topic publishers for outputs
+        # Create topic publishers for everything
         for key, nd in self.all_nodes.items():
             pub = None
             topic_name = self.ns + '/' + str(key)
@@ -195,7 +172,6 @@ class OpcuaData:
                 pub = rospy.Publisher(topic_name, Bool, queue_size=1)
             elif isinstance(val, int) or isinstance(val, IntEnum):
                 pub = rospy.Publisher(topic_name, Int32, queue_size=1)
-
             else:
                 rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
 
@@ -210,10 +186,10 @@ class OpcuaData:
 
             name = str(key)
             topic_name = self.ns + '/' + name.replace('.', '/')
-
+            val = nd.value
             if isinstance(val, float):
                 srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetFloat32,
-                                            (lambda req, var_name=name: self.svc_handler(req, str(var_name),
+                                            (lambda req, var_name=name: self.svc_handler(req, var_name,
                                                                                      pushcorp_msgs.srv.SetFloat32Response)))
             elif isinstance(val, bool):
                 srv = aiorospy.AsyncService(topic_name, std_srvs.srv.SetBool,
@@ -229,15 +205,13 @@ class OpcuaData:
             if srv is not None:
                 self.srvs.append(srv)
 
-        kids = await ua_utils.get_node_children(self.st_data_node)
-
-        # self.event_loop.create_task(self.topic_listeners_init())
+        self.event_loop.create_task(self.heartbeat_co())
         self.event_loop.create_task(self.svc_handlers_init())
         self.event_loop.create_task(self.topic_publishers_init())
 
     async def svc_handler(self, req, name, ret_type):
         name = name
-        rospy.loginfo(f'Updating {name} to {req.data}')
+        rospy.logdebug('Updating %s to %s', name, req.data)
         try:
             await self.set_named_val(name, req.data)
             return ret_type(success=True)
@@ -275,70 +249,30 @@ class OpcuaData:
         await asyncio.gather(*[self.topic_listener(sub[0], sub[1]) for sub in self.subs.items()])
 
     async def datachange_notification(self, node, val, data):
-        #with Timer():
         nd = next(nd for nd in self.all_nodes.values() if nd.node == node)
-
         nd.value = val
-        self.updated.set()
-
-
-
-
-        # if node == self.st_data_node:
-        #     if self.lock.locked():  # Updated in the middle of a write?  Could be old values?
-        #         rospy.loginfo('datachange_notification update discarded')
-        #         return
-        #     async with self.lock:  # could this cause old data to overwrite it if a write is blocking?
-        #         self.st_data = val
-        #         self.updated.set()
 
     async def heartbeat_co(self):
-        hb_node = self.status_nodes['status.input.Heartbeat']
+        hb_nd: NodeData = self.status_nodes['status.input.Heartbeat']
         while True:
-            val = not hb_node.value
-            #val = not self.status_nodes #self.st_data.Heartbeat
+            val = not hb_nd.value
             try:
-                #await hb_node.node.set_value
-                await hb_node.node.write_value(ua.DataValue(val))
+                await self.set_named_val('status.input.Heartbeat', val)
+                #await hb_nd.node.write_value(ua.DataValue(val, hb_nd.data_type))
             except asyncio.exceptions.TimeoutError:
                 rospy.logerr(f"{self.ns} Heartbeat to opcua timed out")
                 raise
+            except:
+                traceback.print_exc()
             await asyncio.sleep(1)
-
-    def get_input_vals(self):
-        return self.st_data.input
-
-    def get_output_vals(self):
-        return self.st_data.output
-
-    async def set_input_vals(self, data):
-        try:
-            await self.st_data_input_node.write_value(ua.DataValue(data))
-        except:
-            raise
 
     async def set_named_val(self, name: str, value: any):
 
-        nd: NodeData = self.input_nodes[name]
+        nd: NodeData = self.all_nodes[name]
         try:
             await nd.node.write_value(ua.DataValue(ua.Variant(Value=value, VariantType=nd.data_type)))
         except:
             traceback.print_exc()
-
-    # async def set_named_val1(self, name: str, value: any):
-    #     ####@TODO look at this.  The intenet was to make sure I have fresh input data.
-    #     # This whole "write a full struct thing" is probably more complicated than it's worth
-    #     await self.updated.wait()
-    #     async with self.lock:
-    #         vals = self.st_data.input
-    #         setattr(vals, name, value)
-    #         try:
-    #             await self.set_input_vals(vals)
-    #             # self.st_data.input = await self.st_data_input_node.read_value()
-    #             self.updated.clear()
-    #         except:
-    #             traceback.print_exc()
-    #             raise
 
 
 class OpcuaComms:
@@ -352,9 +286,6 @@ class OpcuaComms:
         self.client: Client = None
 
         self.opcua_data_list: list[OpcuaData] = []
-
-        self.fcu_data: OpcuaData = None
-        self.spindle_data: OpcuaData = None
 
     # Simple way to keep the loop alive
     async def keep_alive(self):
@@ -398,7 +329,7 @@ if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     loop.set_debug(False)
 
-    opcua_ep = ip = rospy.get_param('~opcua_endpoint', "opc.tcp://192.168.125.39:4840")
+    opcua_ep = rospy.get_param('~opcua_endpoint', "opc.tcp://192.168.125.39:4840")
 
     param_list = []
     fcu_params = OpcuaDataParams(nodeid='ns=4;s=GVL_opcua.stFcuControl', ns='/pushcorp/fcu')
@@ -410,7 +341,12 @@ if __name__ == '__main__':
     test_basic_params = OpcuaDataParams(nodeid='ns=4;s=GVL_opcua.stTestBasic', ns='/pushcorp/test_basic')
 
     # pc = OpcuaComms(opcua_ep, param_list)
-    pc = OpcuaComms(opcua_ep, [test_basic_params])
+    pc = OpcuaComms(opcua_ep, [*param_list, test_basic_params])
+
+    #task = loop.create_task(pc.run())
+
+    test_basic_params_keba = OpcuaDataParams(nodeid='ns=4;s=APPL.Application.GVL_opcua.stTestBasic', ns='/pushcorp/test_basic')
+    #pc2 = OpcuaComms('opc.tcp://192.168.72.3:4842', [test_basic_params_keba])
 
     task = loop.create_task(pc.run())
     # aiorospy.cancel_on_exception(task)
