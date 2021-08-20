@@ -7,14 +7,13 @@ from typing import Dict, Optional, List
 
 import aiorospy
 import asyncua.common.ua_utils as ua_utils
-import asyncua.ua
 import pushcorp_msgs
 import pushcorp_msgs.srv
 import rospy
 import std_srvs.srv
 from asyncua import Client, ua, Node
 from asyncua.common.subscription import Subscription
-from codetiming import Timer
+#  from codetiming import Timer
 from std_msgs.msg import Float32, Bool, Int32
 
 
@@ -43,10 +42,10 @@ class NodeData:
     async def init(self) -> bool:
         try:
             self.data_type = await self.node.read_data_type_as_variant_type()
-            self.value = await self.node.read_value()
+            self.value = await self.node.read_value()  # Read the value now to get its type
             return True
-        #except asyncua.ua.UaError.BadAttributeIdInvalid:
 
+        # @todo find a better way to determine if the node is a variable with a value or not.  Beckhoff returns BadAttributeIdInvalid, Keba returns BadNotImplemented for the struct element
         except ua.UaStatusCodeError as er:
             if er.code not in [ua.StatusCodes.BadAttributeIdInvalid, ua.StatusCodes.BadNotImplemented]:
                 rospy.logerr(f'Unexpected error in NodeData.init: {er}')
@@ -78,17 +77,10 @@ class OpcuaData:
         self.event_loop = asyncio.get_running_loop()
         self.client: Client = client
 
-        self.heartbeat: Node = None  # Heartbeat gets written separately
-
-        # self.st_data = None  # Full data (hb, input, output), will be a struct created by magic
-        # self.st_data_input = None
-
         self.st_root_node: Node = None  # Node the the full data
         self.st_data_input_node: Node = None  # Node to the input (writable) data
         self.sub_opcua: Subscription = None
-        self.lock = asyncio.Lock()
 
-        self.subs = {}  # Ros subscribers
         self.pubs = {}  # Ros publishers
         self.srvs = []  # Ros services
 
@@ -99,23 +91,9 @@ class OpcuaData:
 
         self.updated = asyncio.Event()  # Set when st_data is updated by event
 
-    # async def map_data_input(self, base_node: Node):
-    #
-    #     input_nodeid = base_node.nodeid.to_string() + '.input'
-    #     input_node = self.client.get_node(input_nodeid)
-    #     child_nodes = await ua_utils.get_node_children(input_node)
-    #
-    #     node: Node
-    #     for node in child_nodes[1:]:
-    #         var_name = str(node.nodeid.Identifier).replace(input_node.nodeid.Identifier + '.', '')
-    #         nd = await create_node_data(self.client, '', node=node)
-    #         self.input_nodes[var_name] = nd
-
     async def map_children(self, base_node: Node, subnode_str: str) -> Dict[str, NodeData]:
         sub_nodeid = f'{base_node.nodeid.to_string()}.{subnode_str}'
         sub_node = self.client.get_node(sub_nodeid)
-
-
 
         child_nodes = await ua_utils.get_node_children(sub_node)
 
@@ -136,9 +114,6 @@ class OpcuaData:
 
         self.all_nodes = {**self.status_nodes, **self.input_nodes, **self.output_nodes}
 
-        self.heartbeat = self.status_nodes['status.input.Heartbeat']
-
-
     def make_publisher(self, node: Node) -> rospy.Publisher:
         pass
 
@@ -146,19 +121,16 @@ class OpcuaData:
         rospy.loginfo(f'OpcuaData mapping with nodeid {self.nodeid}')
 
         self.st_root_node = self.client.get_node(self.nodeid)
-
         await self.map_io_data_nodes()
 
-        # Subscribe to the entire struct
+        # subscribe to all the data nodes
         self.sub_opcua = await self.client.create_subscription(self.params.opcua_sub_pd, self)
-        # await self.sub_opcua.subscribe_data_change(self.st_data_node)
 
         items_status = [node.node for node in list(self.status_nodes.values())]
         items_in = [node.node for node in list(self.input_nodes.values())]
         items_out = [node.node for node in list(self.output_nodes.values())]
 
         await self.sub_opcua.subscribe_data_change([*items_status, *items_in, *items_out])
-
 
         # Create topic publishers for everything
         for key, nd in self.all_nodes.items():
@@ -190,15 +162,15 @@ class OpcuaData:
             if isinstance(val, float):
                 srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetFloat32,
                                             (lambda req, var_name=name: self.svc_handler(req, var_name,
-                                                                                     pushcorp_msgs.srv.SetFloat32Response)))
+                                                                                         pushcorp_msgs.srv.SetFloat32Response)))
             elif isinstance(val, bool):
                 srv = aiorospy.AsyncService(topic_name, std_srvs.srv.SetBool,
                                             (lambda req, var_name=name: self.svc_handler(req, var_name,
-                                                                                     std_srvs.srv.SetBoolResponse)))
+                                                                                         std_srvs.srv.SetBoolResponse)))
             elif isinstance(val, int) or isinstance(val, IntEnum):
                 srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetInt32,
                                             (lambda req, var_name=name: self.svc_handler(req, var_name,
-                                                                                     pushcorp_msgs.srv.SetInt32Response)))
+                                                                                         pushcorp_msgs.srv.SetInt32Response)))
             else:
                 rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
 
@@ -258,7 +230,7 @@ class OpcuaData:
             val = not hb_nd.value
             try:
                 await self.set_named_val('status.input.Heartbeat', val)
-                #await hb_nd.node.write_value(ua.DataValue(val, hb_nd.data_type))
+                # await hb_nd.node.write_value(ua.DataValue(val, hb_nd.data_type))
             except asyncio.exceptions.TimeoutError:
                 rospy.logerr(f"{self.ns} Heartbeat to opcua timed out")
                 raise
@@ -273,6 +245,7 @@ class OpcuaData:
             await nd.node.write_value(ua.DataValue(ua.Variant(Value=value, VariantType=nd.data_type)))
         except:
             traceback.print_exc()
+            raise
 
 
 class OpcuaComms:
@@ -343,10 +316,11 @@ if __name__ == '__main__':
     # pc = OpcuaComms(opcua_ep, param_list)
     pc = OpcuaComms(opcua_ep, [*param_list, test_basic_params])
 
-    #task = loop.create_task(pc.run())
+    # task = loop.create_task(pc.run())
 
-    test_basic_params_keba = OpcuaDataParams(nodeid='ns=4;s=APPL.Application.GVL_opcua.stTestBasic', ns='/pushcorp/test_basic')
-    #pc2 = OpcuaComms('opc.tcp://192.168.72.3:4842', [test_basic_params_keba])
+    test_basic_params_keba = OpcuaDataParams(nodeid='ns=4;s=APPL.Application.GVL_opcua.stTestBasic',
+                                             ns='/pushcorp/test_basic')
+    # pc2 = OpcuaComms('opc.tcp://192.168.72.3:4842', [test_basic_params_keba])
 
     task = loop.create_task(pc.run())
     # aiorospy.cancel_on_exception(task)
