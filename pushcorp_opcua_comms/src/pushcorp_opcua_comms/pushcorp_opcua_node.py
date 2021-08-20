@@ -273,7 +273,8 @@ class OpcuaData:
                 traceback.print_exc()
                 raise
 
-#self.st_data_input_node.get_child()
+
+# self.st_data_input_node.get_child()
 class OpcuaComms:
 
     # noinspection PyTypeChecker
