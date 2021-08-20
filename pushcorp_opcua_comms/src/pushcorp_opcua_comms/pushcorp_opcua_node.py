@@ -27,6 +27,28 @@ class OpcuaDataParams:
         self.opcua_sub_pd = opcua_sub_pd
 
 
+async def create_node_data(client: Client, nodeid: str, node: Node = None):
+    nd = NodeData(client, nodeid, node)
+    await nd.init()
+    return nd
+
+
+class NodeData:
+    def __init__(self, client: Client, nodeid: str, node: Node = None):
+        self.client = client
+        self.data_type = ua.VariantType()
+
+        if node is None:
+            self.nodeid = nodeid
+            self.node = client.get_node(nodeid)
+        else:
+            self.node = node
+            self.nodeid = node.nodeid.to_string()
+
+    async def init(self):
+        self.data_type = await self.node.read_data_type_as_variant_type()
+
+
 class OpcuaData:
 
     # noinspection PyTypeChecker
@@ -52,9 +74,27 @@ class OpcuaData:
         self.pubs = {}  # Ros publishers
         self.srvs = []  # Ros services
 
-        # self.input_nodes: dict[str, Node] = {}
+        self.input_nodes: dict[str, NodeData] = {}
 
         self.updated = asyncio.Event()  # Set when st_data is updated by event
+        # self.sub_inputs =
+
+    async def map_data_input(self, base_node: Node):
+
+        input_nodeid = base_node.nodeid.to_string() + '.input'
+        input_node = self.client.get_node(input_nodeid)
+        child_nodes = await ua_utils.get_node_children(input_node)
+
+        node: Node
+        for node in child_nodes[1:]:
+            var_name = str(node.nodeid.Identifier).replace(input_node.nodeid.Identifier + '.', '')
+            nd = await create_node_data(self.client, '', node=node)
+            self.input_nodes[var_name] = nd
+
+
+    async def map_io_data_nodes(self):
+        pass
+
 
     async def map_data(self):
         rospy.loginfo(f'OpcuaData mapping with nodeid {self.nodeid}')
@@ -124,17 +164,18 @@ class OpcuaData:
             elif isinstance(val, bool):
                 srv = aiorospy.AsyncService(topic_name, std_srvs.srv.SetBool,
                                             (lambda req, name=name: self.svc_handler(req, name,
-                                                                                    std_srvs.srv.SetBoolResponse)))
+                                                                                     std_srvs.srv.SetBoolResponse)))
             elif isinstance(val, int) or isinstance(val, IntEnum):
                 srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetInt32,
                                             (lambda req, name=name: self.svc_handler(req, name,
-                                                                                    pushcorp_msgs.srv.SetInt32Response)))
+                                                                                     pushcorp_msgs.srv.SetInt32Response)))
             else:
                 rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
 
             if srv is not None:
                 self.srvs.append(srv)
 
+        await self.map_data_input(self.st_data_node)
         self.event_loop.create_task(self.topic_listeners_init())
         self.event_loop.create_task(self.svc_handlers_init())
         self.event_loop.create_task(self.topic_publishers_init())
@@ -146,7 +187,7 @@ class OpcuaData:
             await self.set_named_val(name, req.data)
             return ret_type(success=True)
         except asyncio.exceptions:
-            return ret_type(success=True, msg=traceback.format_exc(limit=1))
+            return ret_type(success=False, msg=traceback.format_exc(limit=1))
 
     async def svc_handlers_init(self):
         await asyncio.gather(*[srv.start() for srv in self.srvs])
@@ -210,7 +251,15 @@ class OpcuaData:
             raise
 
     async def set_named_val(self, name: str, value: any):
-        ####@TODO look at this.  The intenet was to make sure I have fesh input data.
+
+        nd: NodeData = self.input_nodes[name]
+        try:
+            await nd.node.write_value(ua.DataValue(ua.Variant(Value=value, VariantType=nd.data_type)))
+        except:
+            traceback.print_exc()
+
+    async def set_named_val1(self, name: str, value: any):
+        ####@TODO look at this.  The intenet was to make sure I have fresh input data.
         # This whole "write a full struct thing" is probably more complicated than it's worth
         await self.updated.wait()
         async with self.lock:
