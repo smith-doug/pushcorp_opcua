@@ -1,0 +1,3 @@
+<launch>
+  <node name="pushcorp_opcua_node" pkg="pushcorp_opcua_comms" type="pushcorp_opcua_node"/>
+</launch>
