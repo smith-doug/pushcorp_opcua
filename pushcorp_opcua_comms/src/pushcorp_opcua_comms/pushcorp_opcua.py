@@ -3,7 +3,7 @@
 import asyncio
 import traceback
 from enum import IntEnum
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 
 import aiorospy
 import asyncua.common.ua_utils as ua_utils
@@ -294,41 +294,3 @@ class OpcuaComms:
 
     async def disconnect(self):
         await self.client.disconnect()
-
-
-if __name__ == '__main__':
-    rospy.init_node('pushcorp_comms_node', anonymous=False)
-
-    loop = asyncio.get_event_loop()
-    loop.set_debug(False)
-
-    opcua_ep = rospy.get_param('~opcua_endpoint', "opc.tcp://192.168.125.39:4840")
-
-    param_list = []
-    fcu_params = OpcuaDataParams(nodeid='ns=4;s=GVL_opcua.stFcuControl', ns='/pushcorp/fcu')
-    spindle_params = OpcuaDataParams(nodeid='ns=4;s=GVL_opcua.stSpindleControl', ns='/pushcorp/spindle')
-
-    param_list.append(fcu_params)
-    param_list.append(spindle_params)
-
-    test_basic_params = OpcuaDataParams(nodeid='ns=4;s=GVL_opcua.stTestBasic', ns='/pushcorp/test_basic')
-
-    # pc = OpcuaComms(opcua_ep, param_list)
-    pc = OpcuaComms(opcua_ep, [*param_list, test_basic_params])
-
-    # task = loop.create_task(pc.run())
-
-    test_basic_params_keba = OpcuaDataParams(nodeid='ns=4;s=APPL.Application.GVL_opcua.stTestBasic',
-                                             ns='/pushcorp/test_basic')
-    # pc2 = OpcuaComms('opc.tcp://192.168.72.3:4842', [test_basic_params_keba])
-
-    task = loop.create_task(pc.run())
-    # aiorospy.cancel_on_exception(task)
-    aiorospy.cancel_on_shutdown(task)
-
-    try:
-        loop.run_until_complete(task)
-    except asyncio.CancelledError:
-        pass
-    except:
-        traceback.print_exc()
