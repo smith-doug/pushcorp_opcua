@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
 import asyncio
-import aiorospy
+
 import rospy
 
-from pushcorp_opcua_comms import *
+import aiorospy
+from pushcorp_opcua_comms import OpcuaDataParams, OpcuaComms
 
 if __name__ == '__main__':
     rospy.init_node('pushcorp_comms_node', anonymous=False)
@@ -42,6 +43,6 @@ if __name__ == '__main__':
         loop.run_until_complete(task)
     except asyncio.CancelledError:
         pass
-    except:
+    except BaseException:
         pass
         # traceback.print_exc()

@@ -3,18 +3,18 @@
 import asyncio
 import traceback
 from enum import IntEnum
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Any
 
-import aiorospy
 import asyncua.common.ua_utils as ua_utils
-import pushcorp_msgs
 import pushcorp_msgs.srv
 import rospy
 import std_srvs.srv
 from asyncua import Client, ua, Node
 from asyncua.common.subscription import Subscription
 #  from codetiming import Timer
-from std_msgs.msg import Float32, Bool, Int32
+from std_msgs.msg import Float32, Bool, Int32, String
+
+import aiorospy
 
 
 class OpcuaDataParams:
@@ -40,12 +40,17 @@ class NodeData:
             self.nodeid = node.nodeid.to_string()
 
     async def init(self) -> bool:
+        """
+        Initialize this NodeData.  This needs to await to get the data from the server.
+        :return: True if it was possible to get the node data type and value
+        """
         try:
             self.data_type = await self.node.read_data_type_as_variant_type()
             self.value = await self.node.read_value()  # Read the value now to get its type
             return True
 
-        # @todo find a better way to determine if the node is a variable with a value or not.  Beckhoff returns BadAttributeIdInvalid, Keba returns BadNotImplemented for the struct element
+        # @todo find a better way to determine if the node is a variable with a value or not.
+        #  Beckhoff returns BadAttributeIdInvalid, Keba returns BadNotImplemented for the struct element
         except ua.UaStatusCodeError as er:
             if er.code not in [ua.StatusCodes.BadAttributeIdInvalid, ua.StatusCodes.BadNotImplemented]:
                 rospy.logerr(f'Unexpected error in NodeData.init: {er}')
@@ -58,6 +63,13 @@ class NodeData:
 
 
 async def create_node_data(client: Client, nodeid: str, node: Node = None) -> Optional[NodeData]:
+    """
+    Create and init a new NodeData
+    :param client:
+    :param nodeid:
+    :param node:
+    :return: Initialized NodeData or None if it failed
+    """
     nd = NodeData(client, nodeid, node)
     ok = await nd.init()
     if ok:
@@ -67,6 +79,29 @@ async def create_node_data(client: Client, nodeid: str, node: Node = None) -> Op
 
 
 class OpcuaData:
+    """
+    Creates and manages topics and services for specially defined opcua data structures.
+
+    The mapped data must have the following structure:
+    {
+        status {
+            input {
+                Heartbeat: BOOL;
+            }
+            output {
+                Heartbeat	: BOOL;
+                Error	: BOOL;
+                Connected	: BOOL;
+            }
+        }
+        input {
+            data from ros->plc
+        }
+        output {
+            data from plc->ros
+        }
+    }
+    """
 
     # noinspection PyTypeChecker
     def __init__(self, client: Client, params: OpcuaDataParams):
@@ -84,10 +119,13 @@ class OpcuaData:
         self.pubs = {}  # Ros publishers
         self.srvs = []  # Ros services
 
-        self.status_nodes: Dict[str, NodeData] = {}  # Status values written/read from the PLC
+        # Status values written/read from the PLC
+        self.status_nodes: Dict[str, NodeData] = {}
         self.input_nodes: Dict[str, NodeData] = {}  # Values written to the PLC
         self.output_nodes: Dict[str, NodeData] = {}  # Values read from the PLC
-        self.all_nodes: Dict[str, NodeData] = {}  #
+
+        # Full dict of all nodes.  Stored as {important part of node name, nodedata}
+        self.all_nodes: Dict[str, NodeData] = {}
 
         self.updated = asyncio.Event()  # Set when st_data is updated by event
 
@@ -100,7 +138,7 @@ class OpcuaData:
         ret_nodes: Dict[str, NodeData] = {}
         node: Node
         for node in child_nodes[1:]:
-            var_name = f'{subnode_str}.' + str(node.nodeid.Identifier).replace(sub_node.nodeid.Identifier + '.', '')
+            var_name = node.nodeid.Identifier.replace(base_node.nodeid.Identifier + '.', '')
             nd = await create_node_data(self.client, '', node=node)
             if nd is not None:
                 ret_nodes[var_name] = nd
@@ -126,9 +164,9 @@ class OpcuaData:
         # subscribe to all the data nodes
         self.sub_opcua = await self.client.create_subscription(self.params.opcua_sub_pd, self)
 
-        items_status = [node.node for node in list(self.status_nodes.values())]
-        items_in = [node.node for node in list(self.input_nodes.values())]
-        items_out = [node.node for node in list(self.output_nodes.values())]
+        items_status = [nd.node for nd in list(self.status_nodes.values())]
+        items_in = [nd.node for nd in list(self.input_nodes.values())]
+        items_out = [nd.node for nd in list(self.output_nodes.values())]
 
         await self.sub_opcua.subscribe_data_change([*items_status, *items_in, *items_out])
 
@@ -144,6 +182,8 @@ class OpcuaData:
                 pub = rospy.Publisher(topic_name, Bool, queue_size=1)
             elif isinstance(val, int) or isinstance(val, IntEnum):
                 pub = rospy.Publisher(topic_name, Int32, queue_size=1)
+            elif isinstance(val, str):
+                pub = rospy.Publisher(topic_name, String, queue_size=1)
             else:
                 rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
 
@@ -152,31 +192,37 @@ class OpcuaData:
 
         self.event_loop.create_task(self.topic_publishers_init())
 
-        # Create services
+        # Create services.  The callbacks will be lambdas to store the name of the var to update so that 1 handler
+        # can be used for all the dynamically created services
         for key, nd in self.input_nodes.items():
             srv = None
 
-            name = str(key)
-            topic_name = self.ns + '/' + name.replace('.', '/')
+            name = str(key)  # store this for the service call
+            topic_name = self.ns + '/' + name.replace('.', '/')  # ex: ns/status/input/Heartbeat
             val = nd.value
+
+            srv_type = None
+
             if isinstance(val, float):
-                srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetFloat32,
-                                            (lambda req, var_name=name: self.svc_handler(req, var_name,
-                                                                                         pushcorp_msgs.srv.SetFloat32Response)))
+                srv_type = pushcorp_msgs.srv.SetFloat32
             elif isinstance(val, bool):
-                srv = aiorospy.AsyncService(topic_name, std_srvs.srv.SetBool,
-                                            (lambda req, var_name=name: self.svc_handler(req, var_name,
-                                                                                         std_srvs.srv.SetBoolResponse)))
+                srv_type = std_srvs.srv.SetBool
             elif isinstance(val, int) or isinstance(val, IntEnum):
-                srv = aiorospy.AsyncService(topic_name, pushcorp_msgs.srv.SetInt32,
-                                            (lambda req, var_name=name: self.svc_handler(req, var_name,
-                                                                                         pushcorp_msgs.srv.SetInt32Response)))
+                srv_type = pushcorp_msgs.srv.SetInt32
+            elif isinstance(val, str):
+                srv_type = pushcorp_msgs.srv.SetString
             else:
                 rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
+
+            if srv_type is not None:
+                srv_resp_type = srv_type._response_class
+                srv = aiorospy.AsyncService(topic_name, srv_type,
+                                            (lambda req, var_name=name: self.svc_handler(req, var_name, srv_resp_type)))
 
             if srv is not None:
                 self.srvs.append(srv)
 
+        # Create handlers in a separate tasks so I can freely await and not worry about blocking
         self.event_loop.create_task(self.heartbeat_co())
         self.event_loop.create_task(self.svc_handlers_init())
         self.event_loop.create_task(self.topic_publishers_init())
@@ -204,7 +250,7 @@ class OpcuaData:
                     await(asyncio.sleep(1.0))
 
                 await asyncio.sleep(self.params.topic_pub_pd)
-        except:
+        except BaseException:
             traceback.print_exc()
             raise
 
@@ -212,15 +258,14 @@ class OpcuaData:
         for key, val in self.pubs.items():
             self.event_loop.create_task(self.topic_publisher(key, val))
 
-    async def topic_listener(self, name, sub):
-        async for msg in sub.subscribe():
-            print(f'{sub.name} Heard {msg.data}')
-            await self.set_named_val(name, msg.data)
-
-    async def topic_listeners_init(self):
-        await asyncio.gather(*[self.topic_listener(sub[0], sub[1]) for sub in self.subs.items()])
-
     async def datachange_notification(self, node, val, data):
+        """
+        Callback for subscribed opcua data
+        :param node:
+        :param val:
+        :param data:
+        """
+        # Find the correct NodeData and update its value
         nd = next(nd for nd in self.all_nodes.values() if nd.node == node)
         nd.value = val
 
@@ -230,20 +275,19 @@ class OpcuaData:
             val = not hb_nd.value
             try:
                 await self.set_named_val('status.input.Heartbeat', val)
-                # await hb_nd.node.write_value(ua.DataValue(val, hb_nd.data_type))
             except asyncio.exceptions.TimeoutError:
                 rospy.logerr(f"{self.ns} Heartbeat to opcua timed out")
                 raise
-            except:
+            except BaseException:
                 traceback.print_exc()
             await asyncio.sleep(1)
 
-    async def set_named_val(self, name: str, value: any):
+    async def set_named_val(self, name: str, value: Any):
 
         nd: NodeData = self.all_nodes[name]
         try:
             await nd.node.write_value(ua.DataValue(ua.Variant(Value=value, VariantType=nd.data_type)))
-        except:
+        except BaseException:
             traceback.print_exc()
             raise
 
@@ -258,7 +302,7 @@ class OpcuaComms:
         self.event_loop = None
         self.client: Client = None
 
-        self.opcua_data_list: list[OpcuaData] = []
+        self.opcua_data_list: List[OpcuaData] = []
 
     # Simple way to keep the loop alive
     async def keep_alive(self):
