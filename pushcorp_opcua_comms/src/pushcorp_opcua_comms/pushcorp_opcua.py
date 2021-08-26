@@ -11,17 +11,25 @@ import rospy
 import std_srvs.srv
 from asyncua import Client, ua, Node
 from asyncua.common.subscription import Subscription
-#  from codetiming import Timer
+from codetiming import Timer
 from std_msgs.msg import Float32, Bool, Int32, String
+import std_msgs.msg
 
 import aiorospy
 
 
 class OpcuaDataParams:
-    def __init__(self, nodeid='', ns='', topic_pub_pd=0.01, opcua_sub_pd=0.005):
+    def __init__(self, nodeid='', ns='', topic_pub_pd=10, opcua_sub_pd=10):
+        """
+        Parameters for this OpcuaData instance
+        :param nodeid: String to the struct, like 'ns=4;s=APPL.Application.GVL_opcua.stTestBasic'
+        :param ns: Namespace to create topics/services in
+        :param topic_pub_pd: Period for publishing topics in ms
+        :param opcua_sub_pd: Desired period for opcua subscription.  May be overridden by the server
+        """
         self.nodeid = nodeid
         self.ns = ns
-        self.topic_pub_pd = topic_pub_pd
+        self.topic_pub_pd = topic_pub_pd / 1000.0
         self.opcua_sub_pd = opcua_sub_pd
 
 
@@ -50,16 +58,23 @@ class NodeData:
             return True
 
         # @todo find a better way to determine if the node is a variable with a value or not.
-        #  Beckhoff returns BadAttributeIdInvalid, Keba returns BadNotImplemented for the struct element
         except ua.UaStatusCodeError as er:
-            if er.code not in [ua.StatusCodes.BadAttributeIdInvalid, ua.StatusCodes.BadNotImplemented]:
-                rospy.logerr(f'Unexpected error in NodeData.init: {er}')
-            else:
+            #  Beckhoff returns BadAttributeIdInvalid, Keba returns BadNotImplemented for the struct element.  ok to continue
+            if er.code in [ua.StatusCodes.BadAttributeIdInvalid, ua.StatusCodes.BadNotImplemented]:
                 pass
+            else:
+                rospy.logerr(f'Unexpected error in NodeData.init: {er}')
             return False
 
     def get_value(self):
         return self.value
+
+    def __eq__(self, other):
+        if isinstance(other, Node):
+            return self.node == other
+        else:
+            return isinstance(other, NodeData) and self.node == other.node
+        return False
 
 
 async def create_node_data(client: Client, nodeid: str, node: Node = None) -> Optional[NodeData]:
@@ -129,8 +144,14 @@ class OpcuaData:
 
         self.updated = asyncio.Event()  # Set when st_data is updated by event
 
-    async def map_children(self, base_node: Node, subnode_str: str) -> Dict[str, NodeData]:
-        sub_nodeid = f'{base_node.nodeid.to_string()}.{subnode_str}'
+    async def map_children(self, root_node: Node, subnode_str: str) -> Dict[str, NodeData]:
+        f"""
+        Creates a NodeData for each subnode of (root_node.nodeid).(subnode_str) 
+        :param root_node: The root node of the structure to be mapped
+        :param subnode_str:
+        :return:
+        """
+        sub_nodeid = f'{root_node.nodeid.to_string()}.{subnode_str}'
         sub_node = self.client.get_node(sub_nodeid)
 
         child_nodes = await ua_utils.get_node_children(sub_node)
@@ -138,7 +159,7 @@ class OpcuaData:
         ret_nodes: Dict[str, NodeData] = {}
         node: Node
         for node in child_nodes[1:]:
-            var_name = node.nodeid.Identifier.replace(base_node.nodeid.Identifier + '.', '')
+            var_name = node.nodeid.Identifier.replace(root_node.nodeid.Identifier + '.', '')
             nd = await create_node_data(self.client, '', node=node)
             if nd is not None:
                 ret_nodes[var_name] = nd
@@ -152,9 +173,6 @@ class OpcuaData:
 
         self.all_nodes = {**self.status_nodes, **self.input_nodes, **self.output_nodes}
 
-    def make_publisher(self, node: Node) -> rospy.Publisher:
-        pass
-
     async def map_data(self):
         rospy.loginfo(f'OpcuaData mapping with nodeid {self.nodeid}')
 
@@ -163,6 +181,8 @@ class OpcuaData:
 
         # subscribe to all the data nodes
         self.sub_opcua = await self.client.create_subscription(self.params.opcua_sub_pd, self)
+        rospy.loginfo(
+            f'Requested subscription with period {self.params.opcua_sub_pd}, actual period is {self.sub_opcua.parameters.RequestedPublishingInterval}')
 
         items_status = [nd.node for nd in list(self.status_nodes.values())]
         items_in = [nd.node for nd in list(self.input_nodes.values())]
@@ -176,18 +196,20 @@ class OpcuaData:
             topic_name = self.ns + '/' + str(key)
             topic_name = topic_name.replace('.', '/')
             val = nd.value
+            msg_type = None
             if isinstance(val, float):
-                pub = rospy.Publisher(topic_name, Float32, queue_size=1)
+                msg_type = std_msgs.msg.Float32
             elif isinstance(val, bool):
-                pub = rospy.Publisher(topic_name, Bool, queue_size=1)
+                msg_type = std_msgs.msg.Bool
             elif isinstance(val, int) or isinstance(val, IntEnum):
-                pub = rospy.Publisher(topic_name, Int32, queue_size=1)
+                msg_type = std_msgs.msg.Int32
             elif isinstance(val, str):
-                pub = rospy.Publisher(topic_name, String, queue_size=1)
+                msg_type = std_msgs.msg.String
             else:
                 rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
 
-            if pub is not None:
+            if msg_type is not None:
+                pub = rospy.Publisher(topic_name, msg_type, queue_size=1)
                 self.pubs[str(key)] = pub
 
         self.event_loop.create_task(self.topic_publishers_init())
@@ -217,7 +239,8 @@ class OpcuaData:
             if srv_type is not None:
                 srv_resp_type = srv_type._response_class
                 srv = aiorospy.AsyncService(topic_name, srv_type,
-                                            (lambda req, var_name=name: self.svc_handler(req, var_name, srv_resp_type)))
+                                            (lambda req, var_name=name, ret_type=srv_resp_type:
+                                             self.svc_handler(req, var_name, ret_type)))
 
             if srv is not None:
                 self.srvs.append(srv)
@@ -229,10 +252,11 @@ class OpcuaData:
 
     async def svc_handler(self, req, name, ret_type):
         name = name
-        rospy.logdebug('Updating %s to %s', name, req.data)
+        rospy.loginfo('Updating %s to %s', name, req.data)
+
         try:
             await self.set_named_val(name, req.data)
-            return ret_type(success=True)
+            return ret_type(success=True, message='')
         except asyncio.exceptions:
             return ret_type(success=False, message=traceback.format_exc())
 
@@ -246,10 +270,10 @@ class OpcuaData:
                 if pub.get_num_connections() > 0:
                     val = nd.value
                     pub.publish(val)
+                    await asyncio.sleep(self.params.topic_pub_pd)
                 else:
                     await(asyncio.sleep(1.0))
 
-                await asyncio.sleep(self.params.topic_pub_pd)
         except BaseException:
             traceback.print_exc()
             raise
@@ -258,7 +282,7 @@ class OpcuaData:
         for key, val in self.pubs.items():
             self.event_loop.create_task(self.topic_publisher(key, val))
 
-    async def datachange_notification(self, node, val, data):
+    async def datachange_notification(self, node: Node, val, data):
         """
         Callback for subscribed opcua data
         :param node:
@@ -283,8 +307,8 @@ class OpcuaData:
             await asyncio.sleep(1)
 
     async def set_named_val(self, name: str, value: Any):
-
         nd: NodeData = self.all_nodes[name]
+
         try:
             await nd.node.write_value(ua.DataValue(ua.Variant(Value=value, VariantType=nd.data_type)))
         except BaseException:
@@ -295,7 +319,7 @@ class OpcuaData:
 class OpcuaComms:
 
     # noinspection PyTypeChecker
-    def __init__(self, opcua_endpoint: str, opcua_params: list):
+    def __init__(self, opcua_endpoint: str, opcua_params: List[OpcuaDataParams]):
         self.opcua_endpoint = opcua_endpoint
         self.opcua_params = opcua_params
 
