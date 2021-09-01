@@ -9,6 +9,7 @@ import asyncua.common.ua_utils as ua_utils
 import pushcorp_msgs.srv
 import rospy
 import std_srvs.srv
+from asyncua.ua import UaStatusCodeError
 from asyncua import Client, ua, Node
 from asyncua.common.subscription import Subscription
 from codetiming import Timer
@@ -59,7 +60,8 @@ class NodeData:
 
         # @todo find a better way to determine if the node is a variable with a value or not.
         except ua.UaStatusCodeError as er:
-            #  Beckhoff returns BadAttributeIdInvalid, Keba returns BadNotImplemented for the struct element.  ok to continue
+            #  Beckhoff returns BadAttributeIdInvalid, Keba returns BadNotImplemented for the struct element.
+            #  ok to continue
             if er.code in [ua.StatusCodes.BadAttributeIdInvalid, ua.StatusCodes.BadNotImplemented]:
                 pass
             else:
@@ -105,7 +107,7 @@ class OpcuaData:
             }
             output {
                 Heartbeat	: BOOL;
-                Error	: BOOL;
+                Error	: UINT;
                 Connected	: BOOL;
             }
         }
@@ -301,6 +303,9 @@ class OpcuaData:
                 await self.set_named_val('status.input.Heartbeat', val)
             except asyncio.exceptions.TimeoutError:
                 rospy.logerr(f"{self.ns} Heartbeat to opcua timed out")
+                raise
+            except UaStatusCodeError as ex:
+                rospy.logerr(str(ex))
                 raise
             except BaseException:
                 traceback.print_exc()
