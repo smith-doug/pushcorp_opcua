@@ -52,6 +52,7 @@
   <depend>message_runtime</depend>
   <depend>rospy</depend>
   <depend>pushcorp_msgs</depend>
+  <depend>aiorospy</depend>
   <buildtool_depend>catkin</buildtool_depend>
 
 
