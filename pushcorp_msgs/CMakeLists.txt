@@ -10,7 +10,8 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 add_message_files(
-  FILES 
+  FILES
+  Int32Array.msg
 )
 
 add_service_files(
@@ -18,6 +19,7 @@ add_service_files(
   SetFloat32.srv
   SetInt32.srv
   SetString.srv
+  SetInt32Array.srv
 )
 
 generate_messages(
