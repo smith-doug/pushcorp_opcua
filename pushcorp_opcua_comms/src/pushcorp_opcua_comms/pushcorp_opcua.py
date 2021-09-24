@@ -7,6 +7,8 @@ from typing import Dict, Optional, List, Any
 
 import asyncua.common.ua_utils as ua_utils
 import pushcorp_msgs.srv
+import pushcorp_msgs.msg as pcm
+
 import rospy
 import std_srvs.srv
 from asyncua.ua import UaStatusCodeError
@@ -41,6 +43,8 @@ class NodeData:
         self.data_type: ua.VariantType = None
         self.value = any
 
+        self.variant: ua.Variant = None
+
         if node is None:
             self.nodeid = nodeid
             self.node = client.get_node(nodeid)
@@ -56,6 +60,7 @@ class NodeData:
         try:
             self.data_type = await self.node.read_data_type_as_variant_type()
             self.value = await self.node.read_value()  # Read the value now to get its type
+            self.variant = (await self.node.read_data_value()).Value
             return True
 
         # @todo find a better way to determine if the node is a variable with a value or not.
@@ -199,12 +204,19 @@ class OpcuaData:
             topic_name = topic_name.replace('.', '/')
             val = nd.value
             msg_type = None
+
+            variant = nd.variant
+            if variant.is_array:
+                val = variant.Value[0]
+
             if isinstance(val, float):
                 msg_type = std_msgs.msg.Float32
             elif isinstance(val, bool):
                 msg_type = std_msgs.msg.Bool
             elif isinstance(val, int) or isinstance(val, IntEnum):
                 msg_type = std_msgs.msg.Int32
+                if variant.is_array:
+                    msg_type = pcm.Int32Array
             elif isinstance(val, str):
                 msg_type = std_msgs.msg.String
             else:
@@ -225,6 +237,10 @@ class OpcuaData:
             topic_name = self.ns + '/' + name.replace('.', '/')  # ex: ns/status/input/Heartbeat
             val = nd.value
 
+            variant = nd.variant
+            if variant.is_array:
+                val = variant.Value[0]
+
             srv_type = None
 
             if isinstance(val, float):
@@ -233,6 +249,8 @@ class OpcuaData:
                 srv_type = std_srvs.srv.SetBool
             elif isinstance(val, int) or isinstance(val, IntEnum):
                 srv_type = pushcorp_msgs.srv.SetInt32
+                if variant.is_array:
+                    srv_type = pushcorp_msgs.srv.SetInt32Array
             elif isinstance(val, str):
                 srv_type = pushcorp_msgs.srv.SetString
             else:
@@ -259,7 +277,10 @@ class OpcuaData:
         try:
             await self.set_named_val(name, req.data)
             return ret_type(success=True, message='')
-        except asyncio.exceptions:
+        except ValueError as ex:
+            return ret_type(success=False, message=str(ex))
+        except:
+            traceback.print_exc()
             return ret_type(success=False, message=traceback.format_exc())
 
     async def svc_handlers_init(self):
@@ -315,9 +336,20 @@ class OpcuaData:
         nd: NodeData = self.all_nodes[name]
 
         try:
-            await nd.node.write_value(ua.DataValue(ua.Variant(Value=value, VariantType=nd.data_type)))
-        except BaseException:
-            traceback.print_exc()
+            variant = nd.variant
+            val = value
+            if variant.is_array:
+                val = list(val)
+                len_old = len(variant.Value)
+                len_new = len(val)
+                if len(val) != len(variant.Value):
+                    raise ValueError(f'Writing array failed.  Expected len: {len(variant.Value)}, got len: {len(val)}')
+
+            new_variant = ua.Variant(Value=val, VariantType=variant.VariantType, is_array=variant.is_array,
+                                     Dimensions=variant.Dimensions)
+            await nd.node.write_value(ua.DataValue(new_variant))
+        except:
+            # traceback.print_exc()
             raise
 
 
