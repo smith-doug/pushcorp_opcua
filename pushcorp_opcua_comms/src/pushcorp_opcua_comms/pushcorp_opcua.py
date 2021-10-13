@@ -141,6 +141,7 @@ class OpcuaData:
             val = nd.value
             msg_type = None
 
+            # @TODO Maybe just check if there is a [ in the key name
             variant = nd.variant
             if variant.is_array:
                 val = variant.Value[0]
@@ -159,8 +160,11 @@ class OpcuaData:
                 rospy.logerr(f'Unknown type {key}, {type(val)} in structure')
 
             if msg_type is not None:
-                pub = rospy.Publisher(topic_name, msg_type, queue_size=1)
-                self.pubs[str(key)] = pub
+                try:
+                    pub = rospy.Publisher(topic_name, msg_type, queue_size=1)
+                    self.pubs[str(key)] = pub
+                except:
+                    print('')
 
             blah = std_msgs.msg.Bool
 
