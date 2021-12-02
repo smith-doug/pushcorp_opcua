@@ -4,9 +4,7 @@ project(pushcorp_msgs)
 find_package(catkin REQUIRED COMPONENTS
   message_generation
   std_msgs
-  std_srvs
-  ros_opcua_msgs
-  ros_opcua_srvs
+  std_srvs  
 )
 
 add_message_files(
@@ -25,12 +23,9 @@ add_service_files(
 generate_messages(
   DEPENDENCIES
   std_msgs
-  std_srvs
-  ros_opcua_msgs
-  ros_opcua_srvs
+  std_srvs    
 )
 
 catkin_package(
- CATKIN_DEPENDS message_runtime std_msgs std_srvs ros_opcua_msgs
-  ros_opcua_srvs
+ CATKIN_DEPENDS message_runtime std_msgs std_srvs   
 )
