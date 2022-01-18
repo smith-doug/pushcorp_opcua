@@ -1,0 +1,5 @@
+repositories:
+  aiorospy:
+    type: git
+    url: https://github.com/smith-doug/aiorospy.git
+    version: noetic-updated
