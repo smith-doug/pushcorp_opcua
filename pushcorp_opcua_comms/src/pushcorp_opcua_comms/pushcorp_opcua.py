@@ -166,8 +166,6 @@ class OpcuaData:
                 except:
                     print('')
 
-            blah = std_msgs.msg.Bool
-
         self.event_loop.create_task(self.topic_publishers_init())
 
         # Create services.  The callbacks will be lambdas to store the name of the var to update so that 1 handler
@@ -282,8 +280,6 @@ class OpcuaData:
             val = value
             if variant.is_array:
                 val = list(val)
-                len_old = len(variant.Value)
-                len_new = len(val)
                 if len(val) != len(variant.Value):
                     raise ValueError(f'Writing array failed.  Expected len: {len(variant.Value)}, got len: {len(val)}')
 
