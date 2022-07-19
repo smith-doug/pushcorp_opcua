@@ -294,7 +294,9 @@ class OpcuaData:
 class OpcuaComms:
 
     # noinspection PyTypeChecker
-    def __init__(self, opcua_endpoint: str, opcua_params: List[OpcuaDataParams]):
+    def __init__(self, opcua_endpoint: str, opcua_params: List[OpcuaDataParams],
+                 security_string: str = None):
+        self.security_string = security_string
         self.opcua_endpoint = opcua_endpoint
         self.opcua_params = opcua_params
 
@@ -311,6 +313,9 @@ class OpcuaComms:
     async def connect(self):
         self.event_loop = asyncio.get_running_loop()
         self.client = Client(self.opcua_endpoint)
+
+        await self.client.set_security_string(self.security_string)
+
         try:
             await self.client.connect()
             rospy.loginfo(f'opcua client connected to {self.opcua_endpoint}')
