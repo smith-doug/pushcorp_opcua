@@ -150,6 +150,8 @@ class OpcuaData:
                 msg_type = std_msgs.msg.Float32
             elif isinstance(val, bool):
                 msg_type = std_msgs.msg.Bool
+            elif variant.VariantType == ua.VariantType.UInt32:
+                msg_type = std_msgs.msg.UInt32
             elif isinstance(val, int) or isinstance(val, IntEnum):
                 msg_type = std_msgs.msg.Int32
                 if variant.is_array:
